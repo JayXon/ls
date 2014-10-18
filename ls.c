@@ -9,6 +9,7 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <bsd/stdlib.h>
 #include <bsd/string.h>
 
 #include <ctype.h>
@@ -30,12 +31,12 @@
 
 
 #define DEFAULT_BLOCKSIZE 512
-
+#define MAX_HUMAN_LEN 4
 
 static enum {
     /* -f,   default    -t,        -S */
     NO_SORT, NAME_SORT, TIME_SORT, SIZE_SORT
-} sort_method = NAME_SORT;      
+} sort_method = NAME_SORT;
 
 static enum {
     /* -t, -u,    -c */
@@ -78,7 +79,7 @@ get_blocks(unsigned blocks)
     return (blocks * S_BLKSIZE + block_size - 1) / block_size;
 }
 
-static char *
+static const char *
 get_username(uid_t uid)
 {
     struct passwd *p = getpwuid(uid);
@@ -87,7 +88,7 @@ get_username(uid_t uid)
     return NULL;
 }
 
-static char *
+static const char *
 get_groupname(gid_t gid)
 {
     struct group *g = getgrgid(gid);
@@ -108,6 +109,18 @@ get_time(struct stat *s)
     default:
         return s->st_mtime;
     }
+}
+
+static const char *
+get_human(unsigned n)
+{
+    static char human_buf[MAX_HUMAN_LEN + 1];
+    if (humanize_number(human_buf, sizeof(human_buf), n, "",
+        HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE) == -1) {
+        warn("humanize_number");
+        return "";
+    }
+    return human_buf;
 }
 
 /* 
@@ -249,6 +262,7 @@ print_fts_children(FTS *ftsp)
     int max_major = 0;
     int max_minor = 0;
     int item_count = 0;
+    const char *tmp;
 
     /* Calculate all the max */
     for (FTSENT *p = head; p; p = p->fts_link) {
@@ -277,7 +291,6 @@ print_fts_children(FTS *ftsp)
                 max_blocks = sp->st_blocks;
 
             if (long_format) {
-                char *tmp;
                 if (max_nlink < sp->st_nlink)
                     max_nlink = sp->st_nlink;
                 if (print_id) {
@@ -345,11 +358,15 @@ print_fts_children(FTS *ftsp)
         struct stat *sp = p->fts_statp;
         if (print_inode)
             printf("%*ju ", (int)max_inode, (uintmax_t)sp->st_ino);
-        if (print_blocks)
-            printf("%*u ", (int)max_blocks, get_blocks(sp->st_blocks));
-
+        if (print_blocks) {
+            if (humanize)
+                printf("%*s ", MAX_HUMAN_LEN,
+                    get_human(sp->st_blocks * S_BLKSIZE));
+            else
+                printf("%*u ", (int)max_blocks, get_blocks(sp->st_blocks));
+        }
         if (long_format) {
-            char buf[200], *tmp;    /* 200 is from man page of strftime */
+            char buf[200];  /* 200 is from man page of strftime */
             strmode(sp->st_mode, buf);
             printf("%s %*ju ", buf, (int)max_nlink, (uintmax_t)sp->st_nlink);
 
@@ -365,6 +382,8 @@ print_fts_children(FTS *ftsp)
             if (S_ISCHR(sp->st_mode) || S_ISBLK(sp->st_mode))
                 printf("%*u, %*u ", max_major, major(sp->st_rdev),
                     max_minor, minor(sp->st_rdev));
+            else if (humanize)
+                printf("%*s ", MAX_HUMAN_LEN, get_human(sp->st_size));
             else
                 printf("%*ju ", max_size, (uintmax_t)sp->st_size);
 
