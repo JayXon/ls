@@ -9,43 +9,117 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <bsd/string.h>
 
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fts.h>
+#include <grp.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <pwd.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 
+#define DEFAULT_BLOCKSIZE 512
+
 
 static enum {
+    /* -f,   default    -t,        -S */
     NO_SORT, NAME_SORT, TIME_SORT, SIZE_SORT
-} sort_method = NAME_SORT;
+} sort_method = NAME_SORT;      
 
 static enum {
+    /* -t, -u,    -c */
     MTIME, ATIME, CTIME
 } time_to_use = MTIME;
 
-static bool reversed_sort   = false;
-static bool print_indicator = false;
-static bool print_dir       = false;
-static bool raw_print       = false;
-static bool by_column       = true;
-static bool show_hidden;
-
+static bool reversed_sort   = false;    /* -r */
+static bool print_inode     = false;    /* -i */
+static bool print_blocks    = false;    /* -s */
+static bool print_indicator = false;    /* -F */
+static bool print_dir       = false;    /* -d */
+static bool print_id        = false;    /* -n */
+static bool long_format     = false;    /* -l */
+static bool humanize        = false;    /* -h */
+static bool raw_print       = false;    /* -w */
+static bool by_column       = true;     /* -C */
+static bool show_hidden     = false;    /* -a */
+static int  block_size      = DEFAULT_BLOCKSIZE;
+static bool line_break_before_dir = false;
+static time_t six_month_ago;
 
 static void
 usage(void)
 {
-    (void)fprintf(stderr, "Usage: ls [-AacdFfhiklnqRrSstuw1] [file ...]\n");
+    (void)fprintf(stderr, "Usage: ls [-AacCdFfhiklnqRrSstuwx1] [file ...]\n");
     exit(EXIT_FAILURE);
 }
 
+static int
+uint_length(unsigned int n)
+{
+    if (n == 0)
+        return 1;
+    return floor(log10(n)) + 1;
+}
+
+static unsigned
+get_blocks(unsigned blocks)
+{
+    return (blocks * S_BLKSIZE + block_size - 1) / block_size;
+}
+
+static char *
+get_username(uid_t uid)
+{
+    struct passwd *p = getpwuid(uid);
+    if (p)
+        return p->pw_name;
+    return NULL;
+}
+
+static char *
+get_groupname(gid_t gid)
+{
+    struct group *g = getgrgid(gid);
+    if (g)
+        return g->gr_name;
+    return NULL;
+}
+
+static time_t
+get_time(struct stat *s)
+{
+    switch (time_to_use) {
+    case ATIME:
+        return s->st_atime;
+    case CTIME:
+        return s->st_ctime;
+    case MTIME:
+    default:
+        return s->st_mtime;
+    }
+}
+
+/* 
+ * replace non-printable characters with '?'
+ */
+static void
+escape_string(char *str, int len)
+{
+    for (int i = 0; i < len; i++)
+        if (!isprint(str[i]))
+            str[i] = '?';
+}
 
 /*
  * compare function for fts_open()
@@ -80,21 +154,8 @@ ftscmp(const FTSENT **a, const FTSENT **b)
 
     switch (sort_method) {
     case TIME_SORT: {
-        time_t atime, btime;
-        switch (time_to_use) {
-        case MTIME:
-            atime = (*a)->fts_statp->st_mtime;
-            btime = (*b)->fts_statp->st_mtime;
-            break;
-        case ATIME:
-            atime = (*a)->fts_statp->st_atime;
-            btime = (*b)->fts_statp->st_atime;
-            break;
-        case CTIME:
-            atime = (*a)->fts_statp->st_ctime;
-            btime = (*b)->fts_statp->st_ctime;
-            break;
-        }
+        time_t atime = get_time((*a)->fts_statp);
+        time_t btime = get_time((*b)->fts_statp);
         if (atime < btime)
             return r;
         else if (atime > btime)
@@ -107,10 +168,11 @@ ftscmp(const FTSENT **a, const FTSENT **b)
         else if ((*a)->fts_statp->st_size > (*b)->fts_statp->st_size)
             return -r;
         break;
-    case NAME_SORT:
-        break;
     case NO_SORT:
         return 0;
+    case NAME_SORT:
+    default:
+        break;
     }
     return r * strcmp((*a)->fts_name, (*b)->fts_name);
 }
@@ -119,12 +181,9 @@ ftscmp(const FTSENT **a, const FTSENT **b)
 static void
 print_file_name(FTSENT *p)
 {
-    if (!raw_print) {
-        /* escape non-printable characters */
-        for (short i = 0; i < p->fts_namelen; i++)
-            if (!isprint(p->fts_name[i]))
-                p->fts_name[i] = '?';
-    }
+    if (!raw_print)
+        escape_string(p->fts_name, p->fts_namelen);
+
     printf("%s", p->fts_name);
     if (print_indicator) {
         switch (p->fts_statp->st_mode & S_IFMT) {
@@ -150,6 +209,27 @@ print_file_name(FTSENT *p)
                 putchar('*');
         }
     }
+    if (long_format && S_ISLNK(p->fts_statp->st_mode)) {
+        int len = -1;
+        char path[PATH_MAX], buf[PATH_MAX];
+
+        if (p->fts_level != FTS_ROOTLEVEL) {
+            len = strlen(p->fts_parent->fts_accpath);
+            memcpy(path, p->fts_parent->fts_accpath, len);
+            path[len] = '/';
+        }
+        strncpy(path + len + 1, p->fts_name, p->fts_namelen + 1);
+
+        if ((len = readlink(path, buf, sizeof(buf) - 1)) == -1)
+            perror("readlink");
+        else {
+            buf[len] = 0;
+            if (!raw_print)
+                escape_string(buf, len);
+
+            printf(" -> %s", buf);
+        }
+    }
     putchar('\n');
 }
 
@@ -158,7 +238,20 @@ print_file_name(FTSENT *p)
 static void
 print_fts_children(FTS *ftsp)
 {
-    for (FTSENT *p = fts_children(ftsp, 0); p; p = p->fts_link) {
+    FTSENT *head = fts_children(ftsp, 0);
+    ino_t max_inode = 0;
+    blkcnt_t max_blocks = 0;
+    nlink_t max_nlink = 0;
+    uintmax_t blocks_sum = 0;
+    int max_uid = 0;
+    int max_gid = 0;
+    int max_size = 0;
+    int max_major = 0;
+    int max_minor = 0;
+    int item_count = 0;
+
+    /* Calculate all the max */
+    for (FTSENT *p = head; p; p = p->fts_link) {
         switch (p->fts_info) {
         case FTS_NS:
         case FTS_DNR:
@@ -167,15 +260,132 @@ print_fts_children(FTS *ftsp)
             break;
         case FTS_D:
             if (p->fts_level == FTS_ROOTLEVEL && !print_dir)
-                return;
+                break;
             /* FALLTHROUGH */
         default:
-            if (p->fts_name[0] != '.' || show_hidden) {
-                print_file_name(p);
+            if (p->fts_name[0] == '.' && !show_hidden)
+                break;
+            item_count++;
+            p->fts_number = 1;  /* flag it to print later */
+
+            struct stat *sp = p->fts_statp;
+            if (print_inode && max_inode < sp->st_ino)
+                max_inode = sp->st_ino;
+
+            blocks_sum += sp->st_blocks;
+            if (print_blocks && max_blocks < sp->st_blocks)
+                max_blocks = sp->st_blocks;
+
+            if (long_format) {
+                char *tmp;
+                if (max_nlink < sp->st_nlink)
+                    max_nlink = sp->st_nlink;
+                if (print_id) {
+                    if (max_uid < sp->st_uid)
+                        max_uid = sp->st_uid;
+                    if (max_gid < sp->st_gid)
+                        max_gid = sp->st_gid;
+                } else {
+                    int len;
+                    if ((tmp = get_username(sp->st_uid)) == NULL)
+                        len = uint_length(sp->st_uid);
+                    else
+                        len = strlen(tmp);
+                    if (max_uid < len)
+                        max_uid = len;
+                    if ((tmp = get_groupname(sp->st_gid)) == NULL)
+                        len = uint_length(sp->st_gid);
+                    else
+                        len = strlen(tmp);
+                    if (max_gid < len)
+                        max_gid = len;
+                }
+                if (S_ISCHR(sp->st_mode) || S_ISBLK(sp->st_mode)) {
+                    if (max_major < major(sp->st_rdev))
+                        max_major = major(sp->st_rdev);
+                    if (max_minor < minor(sp->st_rdev))
+                        max_minor = minor(sp->st_rdev);
+                } else if (max_size < sp->st_size)
+                    max_size = sp->st_size;
             }
-            break;
         }
     }
+
+    if (item_count == 0)    /* nothing will be printed */
+        return;
+
+    if (print_blocks || long_format) {
+        if (head->fts_level != FTS_ROOTLEVEL)
+            printf("total %u\n", get_blocks(blocks_sum));
+        if (print_blocks)
+            max_blocks = uint_length(get_blocks(max_blocks));
+        if (long_format) {
+            max_nlink = uint_length(max_nlink);
+            if (print_id) {
+                max_uid = uint_length(max_uid);
+                max_gid = uint_length(max_gid);
+            }
+            max_size = uint_length(max_size);
+            if (max_major) {    /* skip if no block or character file */
+                max_major = uint_length(max_major);
+                max_minor = uint_length(max_minor);
+                if (max_size < max_major + max_minor + 2)
+                    max_size = max_major + max_minor + 2;
+                else
+                    max_major = max_size - max_minor - 2;
+            }
+        }
+    }
+    if (print_inode)
+        max_inode = uint_length(max_inode);
+
+    for (FTSENT *p = head; p; p = p->fts_link) {
+        if (p->fts_number == 0)
+            continue;
+        struct stat *sp = p->fts_statp;
+        if (print_inode)
+            printf("%*ju ", (int)max_inode, (uintmax_t)sp->st_ino);
+        if (print_blocks)
+            printf("%*u ", (int)max_blocks, get_blocks(sp->st_blocks));
+
+        if (long_format) {
+            char buf[200], *tmp;    /* 200 is from man page of strftime */
+            strmode(sp->st_mode, buf);
+            printf("%s %*ju ", buf, (int)max_nlink, (uintmax_t)sp->st_nlink);
+
+            if (print_id || (tmp = get_username(sp->st_uid)) == NULL)
+                printf("%-*u ", max_uid, sp->st_uid);
+            else
+                printf("%-*s ", max_uid, tmp);
+            if (print_id || (tmp = get_groupname(sp->st_gid)) == NULL)
+                printf("%-*u ", max_gid, sp->st_gid);
+            else
+                printf("%-*s ", max_gid, tmp);
+
+            if (S_ISCHR(sp->st_mode) || S_ISBLK(sp->st_mode))
+                printf("%*u, %*u ", max_major, major(sp->st_rdev),
+                    max_minor, minor(sp->st_rdev));
+            else
+                printf("%*ju ", max_size, (uintmax_t)sp->st_size);
+
+            char *time_fmt[2] = { "%b %e %H:%M", "%b %e  %Y" };
+            time_t t = get_time(sp);
+            tmp = time_fmt[t < six_month_ago];
+            struct tm *tp = localtime(&t);
+            if (tp == NULL)
+                perror("localtime");
+            else {
+                if (strftime(buf, sizeof(buf), tmp, tp) == 0)
+                    perror("strftime");
+                else
+                    printf("%s ", buf);
+            }
+        }
+
+        print_file_name(p);
+    }
+
+    line_break_before_dir = true;
 }
 
 
@@ -183,23 +393,28 @@ int
 main(int argc, char* argv[])
 {
     char c;
+    char *env;
     FTS *ftsp;
     FTSENT *p;
-    int fts_options = FTS_COMFOLLOW | FTS_PHYSICAL;
+    int fts_options = FTS_PHYSICAL;
     /* default is current directory, cast to char *[] make it writable */
     char **fts_argv = (char *[]){ ".", NULL };
-    bool is_recursive = false;
-    bool print_line_break = false;
+    bool is_recursive = false;      /* -R */
 
     /* always show hidden for super user */
     show_hidden = !getuid();
 
-    if (!isatty(fileno(stdout))) {
+    /* set -w and -1 for non terminal */
+    if (!isatty(STDOUT_FILENO)) {
         raw_print = true;
         by_column = false;
     }
 
-    while ((c = getopt(argc, argv, "AacdFfhiklnqRrSstuw1")) != -1) {
+    if (print_blocks && (env = getenv("BLOCKSIZE")) != NULL)
+        if ((block_size = strtol(env, NULL, 10)) <= 0)
+            block_size = DEFAULT_BLOCKSIZE;
+
+    while ((c = getopt(argc, argv, "AacCdFfhiklnqRrSstuwx1")) != -1) {
         switch (c) {
         case 'a':
             fts_options |= FTS_SEEDOT;
@@ -230,27 +445,42 @@ main(int argc, char* argv[])
             break;
         case 'd':
             print_dir = true;
-            fts_options &= ~FTS_COMFOLLOW;
             is_recursive = false;
             break;
         case 'F':
             print_indicator = true;
-            fts_options &= ~FTS_COMFOLLOW;
+            break;
+        case 'i':
+            print_inode = true;
+            break;
+        case 's':
+            print_blocks = true;
             break;
         case 'h':
-        case 'i':
+            humanize = true;
+            break;
         case 'k':
-        case 'l':
+            humanize = false;
+            block_size = 1024;
+            break;
         case 'n':
-        case 's':
+            print_id = true;
+        case 'l':
+            long_format = true;
+            break;
+        case '1':
+            by_column = false;
+            long_format = false;
+            break;
+        case 'C':
+            by_column = true;
+            long_format = false;
+            break;
         case 'q':
             raw_print = false;
             break;
         case 'w':
             raw_print = true;
-            break;
-        case '1':
-            by_column = false;
             break;
         default:
             usage();
@@ -263,6 +493,12 @@ main(int argc, char* argv[])
     /* use operands if given */
     if (argc > 0)
         fts_argv = argv;
+
+    if (long_format) {
+        six_month_ago = time(NULL) - 6 * 30 * 24 * 60 * 60;
+    }
+    else if (!print_indicator && !print_dir)
+        fts_options |= FTS_COMFOLLOW;
 
     if ((ftsp = fts_open(fts_argv, fts_options, ftscmp)) == NULL)
         err(EXIT_FAILURE, "fts_open");
@@ -280,14 +516,14 @@ main(int argc, char* argv[])
             if (p->fts_name[0] != '.' || show_hidden ||
                 p->fts_level == FTS_ROOTLEVEL) {
                 if (is_recursive || argc > 1) {
-                    if (print_line_break)
+                    if (line_break_before_dir)
                         putchar('\n');
                     else
-                        print_line_break = true;
+                        line_break_before_dir = true;
                     printf("%s:\n", p->fts_path);
                 }
                 print_fts_children(ftsp);
-                if (is_recursive)
+                if (is_recursive || errno)  /* don't skip to show error */
                     break;
             }
             (void)fts_set(ftsp, p, FTS_SKIP);
