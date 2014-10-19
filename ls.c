@@ -7,8 +7,10 @@
  *
  */
 
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
 #include <bsd/stdlib.h>
 #include <bsd/string.h>
 
@@ -31,7 +33,9 @@
 
 
 #define DEFAULT_BLOCKSIZE 512
+#define DEFAULT_TERMWIDTH 80
 #define MAX_HUMAN_LEN 4
+
 
 static enum {
     /* -f,   default    -t,        -S */
@@ -40,8 +44,8 @@ static enum {
 
 static enum {
     /* -t, -u,    -c */
-    MTIME, ATIME, CTIME
-} time_to_use = MTIME;
+    USE_MTIME, USE_ATIME, USE_CTIME
+} time_to_use = USE_MTIME;
 
 static bool reversed_sort   = false;    /* -r */
 static bool print_inode     = false;    /* -i */
@@ -55,6 +59,7 @@ static bool raw_print       = false;    /* -w */
 static bool by_column       = true;     /* -C */
 static bool show_hidden     = false;    /* -a */
 static int  block_size      = DEFAULT_BLOCKSIZE;
+static int  terminal_width  = DEFAULT_TERMWIDTH;
 static bool line_break_before_dir = false;
 static time_t six_month_ago;
 
@@ -101,11 +106,11 @@ static time_t
 get_time(struct stat *s)
 {
     switch (time_to_use) {
-    case ATIME:
+    case USE_ATIME:
         return s->st_atime;
-    case CTIME:
+    case USE_CTIME:
         return s->st_ctime;
-    case MTIME:
+    case USE_MTIME:
     default:
         return s->st_mtime;
     }
@@ -220,6 +225,8 @@ print_file_name(FTSENT *p)
         default:
             if (p->fts_statp->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
                 putchar('*');
+            else if (by_column)
+                putchar(' ');
         }
     }
     if (long_format && S_ISLNK(p->fts_statp->st_mode)) {
@@ -243,6 +250,12 @@ print_file_name(FTSENT *p)
             printf(" -> %s", buf);
         }
     }
+    if (by_column) {
+        if (p->fts_pointer) {
+            printf("%*c", (int)(p->fts_number - p->fts_namelen + 1), ' ');
+            return;
+        }
+    }
     putchar('\n');
 }
 
@@ -262,6 +275,7 @@ print_fts_children(FTS *ftsp)
     int max_major = 0;
     int max_minor = 0;
     int item_count = 0;
+    int max_columns = 1;
     const char *tmp;
 
     /* Calculate all the max */
@@ -283,6 +297,7 @@ print_fts_children(FTS *ftsp)
             p->fts_number = 1;  /* flag it to print later */
 
             struct stat *sp = p->fts_statp;
+
             if (print_inode && max_inode < sp->st_ino)
                 max_inode = sp->st_ino;
 
@@ -351,6 +366,84 @@ print_fts_children(FTS *ftsp)
     }
     if (print_inode)
         max_inode = uint_length(max_inode);
+
+    if (by_column) {
+        int i = 0;
+        int others_width = 1 + max_inode + !!max_inode + 
+            max_blocks + !!max_blocks;
+        int width[item_count];
+        int n_columns = 2;
+        int n_rows;
+
+        while (n_columns <= item_count) {
+            n_rows = (item_count + n_columns - 1) / n_columns;
+
+            for (i = 0; i < n_columns; i++)
+                width[i] = 0;
+            i = 0;
+            for (FTSENT *p = head; p; p = p->fts_link) {
+                if (p->fts_number != 0) {
+                    if (width[i / n_rows] < p->fts_namelen)
+                        width[i / n_rows] = p->fts_namelen;
+                    i++;
+                }
+            }
+            int sum = 0;
+            for (i = 0; i < n_columns; i++)
+                sum += width[i];
+            if (sum + others_width * n_columns > terminal_width)
+                break;
+            max_columns = n_columns;
+
+            if (n_columns < n_rows)
+                n_columns++;
+            else if (n_rows != 1)
+                n_columns = (item_count + n_rows - 2) / (n_rows - 1);
+            else
+                break;
+        }
+        if (max_columns > 1) {
+            n_rows = (item_count + max_columns - 1) / max_columns;
+            for (i = 0; i < max_columns; i++)
+                width[i] = 0;
+            i = 0;
+            for (FTSENT *p = head; p; p = p->fts_link) {
+                if (p->fts_number != 0) {
+                    if (width[i / n_rows] < p->fts_namelen)
+                        width[i / n_rows] = p->fts_namelen;
+                    i++;
+                }
+            }
+            FTSENT *q = head;
+            for (i = 0; i < n_rows; q = q->fts_link)
+                i += q->fts_number != 0;
+            /* make fts_pointer points to the item on the right */
+            i = 0;
+            for (FTSENT *p = head; p; p = p->fts_link) {
+                if (p->fts_number != 0) {
+                    p->fts_number = width[i / n_rows];
+                    i++;
+                    p->fts_pointer = q;
+                    if (q)
+                        q = q->fts_link;
+                }
+            }
+            /* rearrange the linked list */
+            i = 1;
+            for (FTSENT *p = head; i <= n_rows;) {
+                q = p;
+                p = p->fts_link;
+                if (q->fts_number != 0) {
+                    while (q->fts_pointer)
+                        q = q->fts_link = q->fts_pointer;
+                    if (i++ < n_rows)
+                        q->fts_link = p;
+                    else
+                        q->fts_link = NULL;
+                }
+            }
+        }
+    }
 
     for (FTSENT *p = head; p; p = p->fts_link) {
         if (p->fts_number == 0)
@@ -445,10 +538,10 @@ main(int argc, char* argv[])
             sort_method = TIME_SORT;
             break;
         case 'u':
-            time_to_use = ATIME;
+            time_to_use = USE_ATIME;
             break;
         case 'c':
-            time_to_use = CTIME;
+            time_to_use = USE_CTIME;
             break;
         case 'S':
             sort_method = SIZE_SORT;
@@ -518,6 +611,14 @@ main(int argc, char* argv[])
     }
     else if (!print_indicator && !print_dir)
         fts_options |= FTS_COMFOLLOW;
+
+    if (by_column) {
+        struct winsize w;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1)
+            warn("ioctl");
+        else
+            terminal_width = w.ws_col;
+    }
 
     if ((ftsp = fts_open(fts_argv, fts_options, ftscmp)) == NULL)
         err(EXIT_FAILURE, "fts_open");
