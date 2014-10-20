@@ -354,6 +354,7 @@ print_fts_children(FTS *ftsp)
         case FTS_DNR:
         case FTS_ERR:
             warnx("%s: %s", p->fts_name, strerror(p->fts_errno));
+            rval++;
             break;
         case FTS_D:
             if (p->fts_level == FTS_ROOTLEVEL && !print_dir)
