@@ -17,10 +17,8 @@
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <fts.h>
 #include <grp.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <pwd.h>
@@ -35,15 +33,15 @@
 #define DEFAULT_BLOCKSIZE 512
 #define DEFAULT_TERMWIDTH 80
 #define MAX_HUMAN_LEN 4
-
+#define WARN(...) do { warn(__VA_ARGS__); rval++; } while(0)
 
 static enum {
-    /* -f,   default    -t,        -S */
+    /* -f,   default    -t,        -S     */
     NO_SORT, NAME_SORT, TIME_SORT, SIZE_SORT
 } sort_method = NAME_SORT;
 
 static enum {
-    /* -t, -u,    -c */
+    /* -t,     -u,        -c     */
     USE_MTIME, USE_ATIME, USE_CTIME
 } time_to_use = USE_MTIME;
 
@@ -55,11 +53,13 @@ static bool print_dir       = false;    /* -d */
 static bool print_id        = false;    /* -n */
 static bool long_format     = false;    /* -l */
 static bool humanize        = false;    /* -h */
-static bool raw_print       = false;    /* -w */
+static bool raw_print       = false;    /* -q, -w */
 static bool by_column       = true;     /* -C */
-static bool show_hidden     = false;    /* -a */
+static bool horizontal      = false;    /* -x */
+static bool show_hidden     = false;    /* -a, -A */
 static int  block_size      = DEFAULT_BLOCKSIZE;
 static int  terminal_width  = DEFAULT_TERMWIDTH;
+static int  rval            = EXIT_SUCCESS;
 static bool line_break_before_dir = false;
 static time_t six_month_ago;
 
@@ -70,21 +70,21 @@ usage(void)
     exit(EXIT_FAILURE);
 }
 
-static int
-uint_length(unsigned int n)
+static inline int
+uint_length(uintmax_t n)
 {
-    if (n == 0)
+    if (n < 10)
         return 1;
     return floor(log10(n)) + 1;
 }
 
-static unsigned
-get_blocks(unsigned blocks)
+static inline uintmax_t
+get_blocks(uintmax_t blocks)
 {
     return (blocks * S_BLKSIZE + block_size - 1) / block_size;
 }
 
-static const char *
+static inline const char *
 get_username(uid_t uid)
 {
     struct passwd *p = getpwuid(uid);
@@ -93,7 +93,7 @@ get_username(uid_t uid)
     return NULL;
 }
 
-static const char *
+static inline const char *
 get_groupname(gid_t gid)
 {
     struct group *g = getgrgid(gid);
@@ -102,7 +102,7 @@ get_groupname(gid_t gid)
     return NULL;
 }
 
-static time_t
+static inline time_t
 get_time(struct stat *s)
 {
     switch (time_to_use) {
@@ -116,27 +116,13 @@ get_time(struct stat *s)
     }
 }
 
-static const char *
-get_human(unsigned n)
+static inline const char *
+get_human(uintmax_t n)
 {
     static char human_buf[MAX_HUMAN_LEN + 1];
-    if (humanize_number(human_buf, sizeof(human_buf), n, "",
-        HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE) == -1) {
-        warn("humanize_number");
-        return "";
-    }
+    if (humanize_number(human_buf, sizeof(human_buf), n, "", HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE) == -1)
+        WARN("humanize_number");
     return human_buf;
-}
-
-/* 
- * replace non-printable characters with '?'
- */
-static void
-escape_string(char *str, int len)
-{
-    for (int i = 0; i < len; i++)
-        if (!isprint(str[i]))
-            str[i] = '?';
 }
 
 /*
@@ -154,55 +140,146 @@ ftscmp(const FTSENT **a, const FTSENT **b)
                 return -1;
         }
     }
+    if (sort_method == NO_SORT)
+        return 0;
 
     int r = reversed_sort ? -1 : 1;
 
     if ((*a)->fts_info == FTS_NS) {
-        if ((*b)->fts_info == FTS_NS)
-            if (sort_method == NO_SORT)
-                return 0;
-            else
-                return r * strcmp((*a)->fts_name, (*b)->fts_name);
-        else
+        if ((*b)->fts_info != FTS_NS)
             return 1;
-    } else {
-        if ((*b)->fts_info == FTS_NS)
-            return -1;
-    }
-
-    switch (sort_method) {
-    case TIME_SORT: {
-        time_t atime = get_time((*a)->fts_statp);
-        time_t btime = get_time((*b)->fts_statp);
-        if (atime < btime)
-            return r;
-        else if (atime > btime)
-            return -r;
-        break;
-    }
-    case SIZE_SORT:
-        if ((*a)->fts_statp->st_size < (*b)->fts_statp->st_size)
-            return r;
-        else if ((*a)->fts_statp->st_size > (*b)->fts_statp->st_size)
-            return -r;
-        break;
-    case NO_SORT:
-        return 0;
-    case NAME_SORT:
-    default:
-        break;
+    } else if ((*b)->fts_info == FTS_NS)
+        return -1;
+    else {
+        switch (sort_method) {
+        case TIME_SORT: {
+            time_t atime = get_time((*a)->fts_statp);
+            time_t btime = get_time((*b)->fts_statp);
+            if (atime < btime)
+                return r;
+            else if (atime > btime)
+                return -r;
+            break;
+        }
+        case SIZE_SORT:
+            if ((*a)->fts_statp->st_size < (*b)->fts_statp->st_size)
+                return r;
+            else if ((*a)->fts_statp->st_size > (*b)->fts_statp->st_size)
+                return -r;
+        case NAME_SORT:
+        default:
+            break;
+        }
     }
     return r * strcmp((*a)->fts_name, (*b)->fts_name);
 }
 
+static inline FTSENT *
+next_visable_fts(FTSENT *p)
+{
+    if (p)
+        do
+            p = p->fts_link;
+        while (p && p->fts_number == 0);
+    return p;
+}
 
+static void
+get_width(int width[], FTSENT *p, int n_columns, int n_rows)
+{
+    memset(width, 0, n_columns * sizeof(int));
+    for (int i = 0; p; p = next_visable_fts(p), i++) {
+        if (horizontal) {
+            if (width[i % n_columns] < p->fts_namelen)
+                width[i % n_columns] = p->fts_namelen;
+        } else {
+            if (width[i / n_rows] < p->fts_namelen)
+                width[i / n_rows] = p->fts_namelen;
+        }
+    }
+}
+
+static void
+adjust_column(FTSENT *head, int item_count, int others_width)
+{
+    FTSENT *p;
+    int i;
+    int width[item_count];
+    int max_columns = 1;
+    int n_rows;
+
+    /* calculate maximum number of columns */
+    for (int n_columns = 2; n_columns <= item_count; ) {
+        n_rows = (item_count + n_columns - 1) / n_columns;
+        get_width(width, head, n_columns, n_rows);
+
+        int sum = others_width * n_columns;
+        for (i = 0; i < n_columns; i++)
+            sum += width[i];
+        if (sum > terminal_width)
+            break;
+
+        max_columns = n_columns;
+
+        if (n_columns < n_rows || horizontal)
+            n_columns++;
+        else if (n_rows > 1)
+            n_columns = (item_count + n_rows - 2) / (n_rows - 1);
+        else
+            break;
+    }
+    if (max_columns == 1)
+        return;
+
+    n_rows = (item_count + max_columns - 1) / max_columns;
+    get_width(width, head, max_columns, n_rows);
+
+    if (horizontal || n_rows == 1) {
+        for (p = head, i = 0; p; p = next_visable_fts(p)) {
+            p->fts_number = width[i++ % max_columns];
+            /* if is not last one of the row */
+            if (i % max_columns && i < item_count)
+                p->fts_pointer = p; /* just make it != NULL */
+        }
+        return;
+    }
+
+    /* make fts_pointer points to the item on the right */
+    FTSENT *q = head;
+    for (i = 0; i < n_rows; i++)
+        q = next_visable_fts(q);
+    for (p = head, i = 0; p; p = next_visable_fts(p)) {
+        p->fts_number = width[i++ / n_rows];
+        p->fts_pointer = q;
+        q = next_visable_fts(q);
+    }
+    /* rearrange the linked list */
+    for (q = p = head, i = 0; i < n_rows; q = p) {
+        p = next_visable_fts(p);
+        while (q->fts_pointer)
+            q = q->fts_link = q->fts_pointer;
+        q->fts_link = ++i < n_rows ? p : NULL;
+    }
+}
+
+/*
+ * print non-printable characters as '?'
+ */
+static inline void
+escape_print(char *str, int len)
+{
+    for (int i = 0; i < len; i++)
+        putchar(isprint(str[i]) ? str[i] : '?');
+}
+
+/*
+ * print file name, indicator and symbolic link
+ */
 static void
 print_file_name(FTSENT *p)
 {
-    if (!raw_print)
-        escape_string(p->fts_name, p->fts_namelen);
+    escape_print(p->fts_name, p->fts_namelen);
 
-    printf("%s", p->fts_name);
     if (print_indicator) {
         switch (p->fts_statp->st_mode & S_IFMT) {
         case S_IFDIR:
@@ -241,25 +318,18 @@ print_file_name(FTSENT *p)
         strncpy(path + len + 1, p->fts_name, p->fts_namelen + 1);
 
         if ((len = readlink(path, buf, sizeof(buf) - 1)) == -1)
-            perror("readlink");
+            WARN("cannot read symbolic link %s", path);
         else {
             buf[len] = 0;
-            if (!raw_print)
-                escape_string(buf, len);
-
-            printf(" -> %s", buf);
+            printf(" -> ");
+            escape_print(buf, len);
         }
     }
-    if (by_column) {
-        if (p->fts_pointer) {
-            printf("%*c", (int)(p->fts_number - p->fts_namelen + 1), ' ');
-            return;
-        }
-    }
-    putchar('\n');
+    if (by_column && p->fts_pointer)
+        printf("%*c", (int)(p->fts_number - p->fts_namelen + 1), ' ');
+    else
+        putchar('\n');
 }
-
-
 
 static void
 print_fts_children(FTS *ftsp)
@@ -271,11 +341,10 @@ print_fts_children(FTS *ftsp)
     uintmax_t blocks_sum = 0;
     int max_uid = 0;
     int max_gid = 0;
-    int max_size = 0;
+    size_t max_size = 0;
     int max_major = 0;
     int max_minor = 0;
     int item_count = 0;
-    int max_columns = 1;
     const char *tmp;
 
     /* Calculate all the max */
@@ -343,10 +412,18 @@ print_fts_children(FTS *ftsp)
         return;
 
     if (print_blocks || long_format) {
-        if (head->fts_level != FTS_ROOTLEVEL)
-            printf("total %u\n", get_blocks(blocks_sum));
-        if (print_blocks)
-            max_blocks = uint_length(get_blocks(max_blocks));
+        if (head->fts_level != FTS_ROOTLEVEL) {
+            if (humanize)
+                printf("total %s\n", get_human(blocks_sum * S_BLKSIZE));
+            else
+                printf("total %ju\n", get_blocks(blocks_sum));
+        }
+        if (print_blocks) {
+            if (humanize)
+                max_blocks = MAX_HUMAN_LEN;
+            else
+                max_blocks = uint_length(get_blocks(max_blocks));
+        }
         if (long_format) {
             max_nlink = uint_length(max_nlink);
             if (print_id) {
@@ -367,96 +444,22 @@ print_fts_children(FTS *ftsp)
     if (print_inode)
         max_inode = uint_length(max_inode);
 
-    if (by_column) {
-        int i = 0;
-        int others_width = 1 + max_inode + !!max_inode + 
-            max_blocks + !!max_blocks;
-        int width[item_count];
-        int n_columns = 2;
-        int n_rows;
+    if (head->fts_number == 0)
+        head = next_visable_fts(head);
 
-        while (n_columns <= item_count) {
-            n_rows = (item_count + n_columns - 1) / n_columns;
+    if (by_column)
+        /* if max_inode or max_blocks is not 0, add 1 more for space */
+        adjust_column(head, item_count, 1 + print_indicator + max_inode + !!max_inode + max_blocks + !!max_blocks);
 
-            for (i = 0; i < n_columns; i++)
-                width[i] = 0;
-            i = 0;
-            for (FTSENT *p = head; p; p = p->fts_link) {
-                if (p->fts_number != 0) {
-                    if (width[i / n_rows] < p->fts_namelen)
-                        width[i / n_rows] = p->fts_namelen;
-                    i++;
-                }
-            }
-            int sum = 0;
-            for (i = 0; i < n_columns; i++)
-                sum += width[i];
-            if (sum + others_width * n_columns > terminal_width)
-                break;
-            max_columns = n_columns;
-
-            if (n_columns < n_rows)
-                n_columns++;
-            else if (n_rows != 1)
-                n_columns = (item_count + n_rows - 2) / (n_rows - 1);
-            else
-                break;
-        }
-        if (max_columns > 1) {
-            n_rows = (item_count + max_columns - 1) / max_columns;
-            for (i = 0; i < max_columns; i++)
-                width[i] = 0;
-            i = 0;
-            for (FTSENT *p = head; p; p = p->fts_link) {
-                if (p->fts_number != 0) {
-                    if (width[i / n_rows] < p->fts_namelen)
-                        width[i / n_rows] = p->fts_namelen;
-                    i++;
-                }
-            }
-            FTSENT *q = head;
-            for (i = 0; i < n_rows; q = q->fts_link)
-                i += q->fts_number != 0;
-            /* make fts_pointer points to the item on the right */
-            i = 0;
-            for (FTSENT *p = head; p; p = p->fts_link) {
-                if (p->fts_number != 0) {
-                    p->fts_number = width[i / n_rows];
-                    i++;
-                    p->fts_pointer = q;
-                    if (q)
-                        q = q->fts_link;
-                }
-            }
-            /* rearrange the linked list */
-            i = 1;
-            for (FTSENT *p = head; i <= n_rows;) {
-                q = p;
-                p = p->fts_link;
-                if (q->fts_number != 0) {
-                    while (q->fts_pointer)
-                        q = q->fts_link = q->fts_pointer;
-                    if (i++ < n_rows)
-                        q->fts_link = p;
-                    else
-                        q->fts_link = NULL;
-                }
-            }
-        }
-    }
-
-    for (FTSENT *p = head; p; p = p->fts_link) {
-        if (p->fts_number == 0)
-            continue;
+    for (FTSENT *p = head; p; p = next_visable_fts(p)) {
         struct stat *sp = p->fts_statp;
         if (print_inode)
             printf("%*ju ", (int)max_inode, (uintmax_t)sp->st_ino);
         if (print_blocks) {
             if (humanize)
-                printf("%*s ", MAX_HUMAN_LEN,
-                    get_human(sp->st_blocks * S_BLKSIZE));
+                printf("%*s ", (int)max_blocks, get_human(sp->st_blocks * S_BLKSIZE));
             else
-                printf("%*u ", (int)max_blocks, get_blocks(sp->st_blocks));
+                printf("%*ju ", (int)max_blocks, get_blocks(sp->st_blocks));
         }
         if (long_format) {
             char buf[200];  /* 200 is from man page of strftime */
@@ -473,30 +476,26 @@ print_fts_children(FTS *ftsp)
                 printf("%-*s ", max_gid, tmp);
 
             if (S_ISCHR(sp->st_mode) || S_ISBLK(sp->st_mode))
-                printf("%*u, %*u ", max_major, major(sp->st_rdev),
-                    max_minor, minor(sp->st_rdev));
+                printf("%*u, %*u ", max_major, major(sp->st_rdev), max_minor, minor(sp->st_rdev));
             else if (humanize)
                 printf("%*s ", MAX_HUMAN_LEN, get_human(sp->st_size));
             else
-                printf("%*ju ", max_size, (uintmax_t)sp->st_size);
+                printf("%*ju ", (int)max_size, (uintmax_t)sp->st_size);
 
             char *time_fmt[2] = { "%b %e %H:%M", "%b %e  %Y" };
             time_t t = get_time(sp);
-            tmp = time_fmt[t < six_month_ago];
             struct tm *tp = localtime(&t);
             if (tp == NULL)
-                perror("localtime");
-            else {
-                if (strftime(buf, sizeof(buf), tmp, tp) == 0)
-                    perror("strftime");
-                else
-                    printf("%s ", buf);
-            }
+                WARN("localtime");
+            else if (strftime(buf, sizeof(buf), time_fmt[t < six_month_ago], tp) == 0)
+                WARN("strftime");
+            else
+                printf("%s ", buf);
         }
 
         print_file_name(p);
     }
-
+    errno = 0;
     line_break_before_dir = true;
 }
 
@@ -504,7 +503,7 @@ print_fts_children(FTS *ftsp)
 int
 main(int argc, char* argv[])
 {
-    char c;
+    char opt;
     char *env;
     FTS *ftsp;
     FTSENT *p;
@@ -513,7 +512,7 @@ main(int argc, char* argv[])
     char **fts_argv = (char *[]){ ".", NULL };
     bool is_recursive = false;      /* -R */
 
-    /* always show hidden for super user */
+    /* true for super-user */
     show_hidden = !getuid();
 
     /* set -w and -1 for non terminal */
@@ -526,8 +525,8 @@ main(int argc, char* argv[])
         if ((block_size = strtol(env, NULL, 10)) <= 0)
             block_size = DEFAULT_BLOCKSIZE;
 
-    while ((c = getopt(argc, argv, "AacCdFfhiklnqRrSstuwx1")) != -1) {
-        switch (c) {
+    while ((opt = getopt(argc, argv, "AacCdFfhiklnqRrSstuwx1")) != -1) {
+        switch (opt) {
         case 'a':
             fts_options |= FTS_SEEDOT;
             /* FALLTHROUGH */
@@ -577,8 +576,10 @@ main(int argc, char* argv[])
             break;
         case 'n':
             print_id = true;
+            /* FALLTHROUGH */
         case 'l':
             long_format = true;
+            by_column = false;
             break;
         case '1':
             by_column = false;
@@ -587,6 +588,12 @@ main(int argc, char* argv[])
         case 'C':
             by_column = true;
             long_format = false;
+            horizontal = false;
+            break;
+        case 'x':
+            by_column = true;
+            long_format = false;
+            horizontal = true;
             break;
         case 'q':
             raw_print = false;
@@ -596,7 +603,6 @@ main(int argc, char* argv[])
             break;
         default:
             usage();
-
         }
     }
     argv += optind;
@@ -606,18 +612,22 @@ main(int argc, char* argv[])
     if (argc > 0)
         fts_argv = argv;
 
-    if (long_format) {
+    if (long_format)
         six_month_ago = time(NULL) - 6 * 30 * 24 * 60 * 60;
-    }
     else if (!print_indicator && !print_dir)
         fts_options |= FTS_COMFOLLOW;
 
     if (by_column) {
+        /* get real terminal width first */
         struct winsize w;
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1)
-            warn("ioctl");
-        else
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1)
             terminal_width = w.ws_col;
+        else if (errno != ENOTTY)
+            WARN("ioctl");
+        /* override it if COLUMNS exist and valid */
+        if ((env = getenv("COLUMNS")) != NULL)
+            if ((w.ws_col = strtol(env, NULL, 10)) > 0)
+                terminal_width = w.ws_col;
     }
 
     if ((ftsp = fts_open(fts_argv, fts_options, ftscmp)) == NULL)
@@ -625,44 +635,41 @@ main(int argc, char* argv[])
 
     print_fts_children(ftsp);
 
-    if (print_dir) {
-        (void)fts_close(ftsp);
-        return EXIT_SUCCESS;
-    }
-
-    while ((p = fts_read(ftsp)) != NULL) {
-        switch (p->fts_info) {
-        case FTS_D:
-            if (p->fts_name[0] != '.' || show_hidden ||
-                p->fts_level == FTS_ROOTLEVEL) {
-                if (is_recursive || argc > 1) {
-                    if (line_break_before_dir)
-                        putchar('\n');
-                    else
-                        line_break_before_dir = true;
-                    printf("%s:\n", p->fts_path);
+    if (!print_dir) {
+        while ((p = fts_read(ftsp)) != NULL) {
+            switch (p->fts_info) {
+            case FTS_D:
+                if (p->fts_name[0] != '.' || show_hidden || p->fts_level == FTS_ROOTLEVEL) {
+                    if (is_recursive || argc > 1) {
+                        if (line_break_before_dir)
+                            putchar('\n');
+                        else
+                            line_break_before_dir = true;
+                        printf("%s:\n", p->fts_path);
+                    }
+                    print_fts_children(ftsp);
+                    if (is_recursive || errno)  /* don't skip to show error */
+                        break;
                 }
-                print_fts_children(ftsp);
-                if (is_recursive || errno)  /* don't skip to show error */
-                    break;
+                (void)fts_set(ftsp, p, FTS_SKIP);
+                break;
+            case FTS_DC:
+                warnx("%s causes a cycle", p->fts_name);
+                rval++;
+                break;
+            case FTS_DNR:
+            case FTS_ERR:
+                warnx("%s: %s", p->fts_name, strerror(p->fts_errno));
+                rval++;
+            default:
+                break;
             }
-            (void)fts_set(ftsp, p, FTS_SKIP);
-            break;
-        case FTS_DC:
-            warnx("%s causes a cycle", p->fts_name);
-            break;
-        case FTS_DNR:
-        case FTS_ERR:
-            warnx("%s: %s", p->fts_name, strerror(p->fts_errno));
-        default:
-            break;
         }
+        if (errno)
+            err(EXIT_FAILURE, "fts_read");
     }
-
-    if (errno)
-        err(EXIT_FAILURE, "fts_read");
 
     (void)fts_close(ftsp);
 
-    return EXIT_SUCCESS;
+    return rval;
 }
