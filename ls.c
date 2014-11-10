@@ -268,8 +268,11 @@ adjust_column(FTSENT *head, int item_count, int others_width)
 static inline void
 escape_print(char *str, int len)
 {
-    for (int i = 0; i < len; i++)
-        putchar(isprint(str[i]) ? str[i] : '?');
+    if (raw_print)
+        printf("%s", str);
+    else
+        for (int i = 0; i < len; i++)
+            putchar(isprint(str[i]) ? str[i] : '?');
 }
 
 /*
@@ -361,7 +364,7 @@ print_fts_children(FTS *ftsp)
                 break;
             /* FALLTHROUGH */
         default:
-            if (p->fts_name[0] == '.' && !show_hidden)
+            if (p->fts_name[0] == '.' && !show_hidden && p->fts_level != FTS_ROOTLEVEL)
                 break;
             item_count++;
             p->fts_number = 1;  /* flag it to print later */
@@ -522,7 +525,7 @@ main(int argc, char* argv[])
         by_column = false;
     }
 
-    if (print_blocks && (env = getenv("BLOCKSIZE")) != NULL)
+    if ((env = getenv("BLOCKSIZE")) != NULL)
         if ((block_size = strtol(env, NULL, 10)) <= 0)
             block_size = DEFAULT_BLOCKSIZE;
 
