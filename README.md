@@ -1,7 +1,7 @@
 ls
 ==
 
-a concise ls(1) command implemention
+a concise ls(1) command implementation.
 
 Supported options: `-AacCdFfhiklnqRrSstuwx1`
 
